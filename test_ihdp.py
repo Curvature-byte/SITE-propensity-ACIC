@@ -8,16 +8,54 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import os
-from simi_ite.data_processor import MyDataset
+from simi_ite.data_processor_test import MyDataset
 from models import *
-from simi_ite.utils import find_three_pairs, get_simi_ground, metric_update, get_three_pair_simi, similarity_score, metric_export,metrics
-# from simi_ite.utils import find_three_pairs, get_simi_ground, get_three_pair_simi, similarity_score
-# from simi_ite.utils_test import metric_update, metric_export,metrics
+from simi_ite.utils import find_three_pairs, get_simi_ground,  get_three_pair_simi, similarity_score
+from simi_ite.utils_test import  metric_update,  metric_export, metrics
 from simi_ite.pddm_net import compute_pddm_loss, PDDMNetwork
 from simi_ite.propensity import load_propensity_score
 import ot
 
 
+def cal_wass(rep_0, rep_1, out_0, out_1, t, yf, device, hparams):
+    yf = yf.unsqueeze(-1)
+    dist = hparams['ot_scale'] * ot.dist(rep_0, rep_1)
+
+    if hparams['gamma'] > 0:
+
+        pred_0_cf = out_1[t == 0]  # predicted outcome for samples in control group given t == 1对照组中样本的预测反事实结果（T=0）
+        pred_1_cf = out_0[t == 1]  # predicted outcome for samples in treated group given t == 0处理组中样本的预测反事实结果（T=1）
+        yf_1 = yf[t == 1]
+        yf_0 = yf[t == 0]
+
+        dist_10 = ot.dist(pred_0_cf, yf_1)
+        dist_01 = ot.dist(yf_0, pred_1_cf)
+
+        dist += hparams['gamma'] * (dist_01 + dist_10)
+
+    if hparams['ot'] == 'ot':
+
+        gamma = ot.sinkhorn(
+            torch.ones(len(rep_0), device=device) / len(rep_0),
+            torch.ones(len(rep_1), device=device) / len(rep_1),
+            dist.detach(),
+            reg=hparams.get('epsilon'),
+            stopThr=1e-4)
+
+    elif hparams['ot'] == 'uot':
+
+        gamma = ot.unbalanced.sinkhorn_unbalanced(
+            torch.ones(len(rep_0), device=device) / len(rep_0),
+            torch.ones(len(rep_1), device=device) / len(rep_1),
+            dist.detach(),
+            reg=hparams.get('epsilon'),
+            stopThr=1e-6,
+            reg_m=hparams.get('kappa'))
+    else:
+        print("ERROR: The hparams.ot is not correctly defined")
+
+    loss_wass = torch.sum(gamma * dist)
+    return loss_wass
 
 
 class BaseEstimator:
@@ -25,11 +63,15 @@ class BaseEstimator:
     def __init__(self, board=None, hparams={}):
         data_name = hparams.get('data')
         print("Current data:", data_name)
-        train_set = MyDataset(f"Datasets/{data_name}/train.csv", fit=True, start= 245000, max_rows=10500)
-        shared_scaler = train_set.scaler
-        traineval_set = MyDataset(f"Datasets/{data_name}/traineval.csv", scaler=shared_scaler, start= 600000, max_rows=12700)
-        eval_set = MyDataset(f"Datasets/{data_name}/eval.csv", scaler=shared_scaler, start= 1000, max_rows=2700)
-        test_set = MyDataset(f"Datasets/{data_name}/test.csv", scaler=shared_scaler, start= 1000, max_rows=1000)
+        # train_set = MyDataset(f"Datasets/{data_name}/train_{hparams['seed']}.csv")
+        # traineval_set = MyDataset(f"Datasets/{data_name}/traineval_{hparams['seed']}.csv")
+        # eval_set = MyDataset(f"Datasets/{data_name}/eval_{hparams['seed']}.csv")
+        # test_set = MyDataset(f"Datasets/{data_name}/test_{hparams['seed']}.csv")
+        train_set = MyDataset(f"Datasets/{data_name}/train.csv")
+        # shared_scaler = train_set.scaler
+        traineval_set = MyDataset(f"Datasets/{data_name}/traineval.csv")
+        eval_set = MyDataset(f"Datasets/{data_name}/eval.csv")
+        test_set = MyDataset(f"Datasets/{data_name}/test.csv")
         self.device = torch.device(hparams.get('device'))
         if hparams['treat_weight'] == 0:
             self.train_loader = DataLoader(train_set, batch_size=hparams.get('batchSize'), drop_last=True,shuffle=True)
@@ -39,34 +81,46 @@ class BaseEstimator:
         self.eval_data = DataLoader(eval_set, batch_size=256,shuffle=True)
         self.test_data = DataLoader(test_set, batch_size=256,shuffle=True)
 
-        self.scaler = shared_scaler
-        self.train_scaler = shared_scaler
-        self.eval_scaler = shared_scaler
-        self.test_scaler = shared_scaler
+        # self.scaler = shared_scaler
+        # self.train_scaler = shared_scaler
+        # self.eval_scaler = shared_scaler
+        # self.test_scaler = shared_scaler
 
         self.train_metric = {
+             "mae_ate": np.array([]),
+             "mae_att": np.array([]),
+             "pehe": np.array([]),
              "r2_f": np.array([]),
              "rmse_f": np.array([]),
-             "mae_f": np.array([]),
-            }
+             "r2_cf": np.array([]),
+             "rmse_cf": np.array([]),
+             "auuc": np.array([]),
+             "rauuc": np.array([])}
         self.eval_metric = deepcopy(self.train_metric)
         self.test_metric = deepcopy(self.train_metric)
 
         self.train_best_metric = {
+             "mae_ate": None,
+             "mae_att": None,
+             "pehe": None,
              "r2_f": None,
              "rmse_f": None,
-             "mae_f": None,
-            }
+             "r2_cf": None,
+             "rmse_cf": None,
+             "auuc": None,
+             "rauuc": None,}
         self.eval_best_metric = deepcopy(self.train_best_metric)
         self.eval_best_metric['r2_f'] = -10  
-        self.loss_metric = {'loss': np.array([]), 'loss_f': np.array([]), 'loss_pddm': np.array([])}
+        self.eval_best_metric["pehe"] = 100
+        self.eval_best_metric['auuc'] = 0
+        self.loss_metric = {'loss': np.array([]), 'loss_f': np.array([]), 'loss_pddm': np.array([]), 'loss_c': np.array([])}
 
         self.epochs = hparams.get('epoch', 200)
         self._pddm_warning_emitted = False
 
-        self.model = TARNetHead(train_set.x_dim - 1, hparams).to(self.device)
+        self.model = TARNetHead(train_set.x_dim, hparams).to(self.device)
         self.rep_model = self.model.rep
-        self.propensity_model = load_propensity_score(model_dir = './simi_ite/tmp/propensity_model' ,input_dim = train_set.x_dim - 1 ,mode="mlp")
+        self.propensity_model = load_propensity_score(model_dir = './simi_ite/IHDP/propensity_model' ,input_dim = train_set.x_dim ,mode="mlp")
         self.pddm_model = PDDMNetwork(
             dim_in=hparams['dim_pddm_in'],
             dim_pddm=hparams['dim_pddm_hide'],
@@ -93,15 +147,28 @@ class BaseEstimator:
             self.model.train()
             self.pddm_model.train()
             for data in self.train_loader:  # train_loader
-                self.optimizer.zero_grad()
+                self.model.zero_grad()
                 data = data.to(self.device)
-                _x, _xt, _t, _yf = data[:, 1:-3], data[:, 1:-2], data[:, -3], data[:, -1]
+                _x, _xt, _t, _yf, _= data[:,:-3], data[:, :-2], data[:, -3], data[:, -2],  data[:, -1]
+                # _x, _xt, _t, _yf = data[:, 1:-3], data[:, 1:-2], data[:, -3], data[:, -1]
                 _pred_f = self.model(_xt).squeeze(-1)
                 _loss_fit = self.criterion(_pred_f, _yf)
-#后面考虑删除下面代码
+
+                _loss_wass = 0
+                wass_indicator = (self.hparams['ot'] != 'none' and epoch > 20 and len(_t.unique()) > 1)
+                if wass_indicator: # Avoid samples coming from same group
+                    _loss_wass = cal_wass(rep_0=self.model.rep_0,
+                                         rep_1=self.model.rep_1,
+                                          out_0=self.model.out_0,
+                                          out_1=self.model.out_1,
+                                          t=_t,
+                                          yf=_yf,
+                                          device=self.device,
+                                          hparams=self.hparams)
+
                 treated = int((_t > 0.5).sum().item())
                 control = int((_t < 0.5).sum().item())
-                pddm_indicator = (epoch >20 and treated >= 2 and control >= 2)
+                pddm_indicator = (epoch >40 and treated >= 2 and control >= 2)
 
                 loss_pddm_tensor = torch.tensor(0.0, device=self.device)
                 loss_pddm_value = 0.0
@@ -127,33 +194,10 @@ class BaseEstimator:
                         ).squeeze()
                         # loss_pddm_value = loss_pddm_tensor.item()
 
-                _loss = _loss_fit + self.hparams['lambda'] * loss_pddm_tensor
+                _loss = _loss_fit + self.hparams['lambda'] * _loss_wass  #+ self.hparams['lambda_pddm'] * loss_pddm_tensor 
                 _loss.backward()
                 self.optimizer.step()
-                # _x_propensity_score, _x_similarity_ground = get_simi_ground(_x.detach().cpu().numpy(),  propensity_model=self.propensity_model)
-                # three_pairs , three_paris_index = find_three_pairs(_x.detach().cpu().numpy(), _t.detach().cpu().numpy(), _x_propensity_score)
-                # three_pairs = torch.tensor(three_pairs, dtype=torch.float32,device=self.device)
-                # _pred_f = self.model(_xt)
-                # three_rep_paris = self.rep_model(three_pairs)
-                
-                # # Section: loss calculation
-                # _loss_fit = self.criterion(_pred_f, _yf)
-
-                # _loss_pddm = 0
-                # pddm_indicator = ( epoch > 20 and len(_t.unique()) > 1)
-                # if pddm_indicator: # Avoid samples coming from same group
-                #     _loss_pddm = compute_pddm_loss(
-                #         self._loss_pddm_model,
-                #         three_rep_paris,
-                #         _x_similarity_ground, three_paris_index
-                #     ).squeeze()
-
-                # _loss = _loss_fit + self.hparams['lambda'] * _loss_pddm
-                # _loss.backward()
-                # self.optimizer.step()
-
-                # Section: metric update
-                # _loss_pddm = loss_pddm_tensor.item() if pddm_indicator else 0
+                _loss_wass = _loss_wass.item() if wass_indicator else 0
                 self.board.add_scalar(
                     'loss/fit_loss',
                     _loss_fit.item(),
@@ -165,6 +209,10 @@ class BaseEstimator:
                 self.board.add_scalar(
                     'loss/total_loss',
                     _loss.item(),
+                    global_step=iter_num)
+                self.board.add_scalar(
+                    'loss/wass_loss',
+                    _loss_wass,
                     global_step=iter_num)
                 iter_num += 1
 
@@ -179,7 +227,7 @@ class BaseEstimator:
                 self.eval_metric = metric_update(self.eval_metric, _eval_metric, self.epoch)
                 [self.board.add_scalar(f"eval/{key}", _eval_metric[key], global_step=self.epoch) for key in _eval_metric.keys()]
 
-                if _eval_metric['r2_f'] > self.eval_best_metric['r2_f']:
+                if abs(_eval_metric['auuc']) > abs(self.eval_best_metric['auuc']):
                 # if abs(_eval_metric['pehe']) < abs(self.eval_best_metric['pehe']):
                     self.eval_best_metric = _eval_metric
                     self.train_best_metric = self.evaluation(data='train')
@@ -215,30 +263,29 @@ class BaseEstimator:
         self.model.eval()
         pred_0 = torch.tensor([], device=self.device)
         yf = deepcopy(pred_0)
-        # pred_1, yf, ycf, t = deepcopy(pred_0), deepcopy(pred_0), deepcopy(pred_0), deepcopy(pred_0),
-
+        pred_1, yf, ycf, t = deepcopy(pred_0), deepcopy(pred_0), deepcopy(pred_0), deepcopy(pred_0),
+ 
         for data in dataloader:
             data = data.to(self.device)
-            _xt, _yf = data[:, 1:-2], data[:, -1]
-            # _x, _t, _yf, _ycf = data[:, :-3], data[:, [-3]], data[:, -2], data[:, -1]
-            # _x_0 = torch.cat([_x, torch.zeros_like(_t, device=self.device)], dim=-1)
-            # _x_1 = torch.cat([_x, torch.ones_like(_t, device=self.device)], dim=-1)
-            _pred_0 = self.model(_xt).reshape([-1])
-            # _pred_1 = self.model(_x_1).reshape([-1])
+            _x, _t, _yf, _ycf = data[:, :-3], data[:, [-3]], data[:, -2], data[:, -1]
+            _x_0 = torch.cat([_x, torch.zeros_like(_t, device=self.device)], dim=-1)
+            _x_1 = torch.cat([_x, torch.ones_like(_t, device=self.device)], dim=-1)
+            _pred_0 = self.model(_x_0).reshape([-1])
+            _pred_1 = self.model(_x_1).reshape([-1])
             pred_0 = torch.cat([pred_0, _pred_0], axis=-1)
-            # pred_1 = torch.cat([pred_1, _pred_1], axis=-1)
+            pred_1 = torch.cat([pred_1, _pred_1], axis=-1)
             yf = torch.cat([yf, _yf], axis=-1)
-            # ycf = torch.cat([ycf, _ycf], axis=-1)
-            # t = torch.cat([t, _t.reshape([-1])], axis=-1)
+            ycf = torch.cat([ycf, _ycf], axis=-1)
+            t = torch.cat([t, _t.reshape([-1])], axis=-1)
 
         pred_0 = pred_0.detach().cpu().numpy()
-        # pred_1 = pred_1.detach().cpu().numpy()
+        pred_1 = pred_1.detach().cpu().numpy()
         yf = yf.cpu().numpy()
-        pred_0 = self.scaler.reverse_y(pred_0)
-        yf = self.scaler.reverse_y(yf)
-        # ycf = ycf.cpu().numpy()
-        # t = t.detach().cpu().numpy()
-        return pred_0, yf # pred_1, yf, ycf, t
+        # pred_0 = self.scaler.reverse_y(pred_0)
+        # yf = self.scaler.reverse_y(yf)
+        ycf = ycf.cpu().numpy()
+        t = t.detach().cpu().numpy()
+        return pred_0, pred_1, yf, ycf, t
 
     def evaluation(self, data: str) -> dict():
 
@@ -246,12 +293,11 @@ class BaseEstimator:
             'train': self.traineval_data,
             'eval': self.eval_data,
             'test': self.test_data}[data]
-        pred_0, yf = self.predict(dataloader)
-        # pred_0, pred_1, yf, ycf, t = self.predict(dataloader)
+        # pred_0, yf, pred_1, yf, ycf, t = self.predict(dataloader)
+        pred_0, pred_1, yf, ycf, t = self.predict(dataloader)
         # pred_0, pred_1, yf = scaler.reverse_y(pred_0), scaler.reverse_y(pred_1), scaler.reverse_y(yf)  # 标签反归一化
-        # mode = 'in-sample' if data == 'train' else 'out-sample'
-        # metric = metrics(pred_0, pred_1, yf, ycf, t, mode)
-        metric = metrics(pred_0, yf)
+        mode = 'in-sample' if data == 'train' else 'out-sample'
+        metric = metrics(pred_0, pred_1, yf, ycf, t, mode)
 
         return metric
 
@@ -270,9 +316,9 @@ if __name__ == "__main__":
 
     hparams.add_argument('--model', type=str, default='ylearner')
     hparams.add_argument('--device', type=str, default='cuda:0')
-    hparams.add_argument('--data', type=str, default='TEP')
+    hparams.add_argument('--data', type=str, default='IHDP')
     hparams.add_argument('--epoch', type=int, default=400)
-    hparams.add_argument('--seed', type=int, default=42)
+    hparams.add_argument('--seed', type=int, default=2)
     hparams.add_argument('--stop_epoch', type=int, default=30, help='tolerance epoch of early stopping')
     hparams.add_argument('--treat_weight', type=float, default=0.0, help='whether or not to balance sample')
 
@@ -283,12 +329,21 @@ if __name__ == "__main__":
     hparams.add_argument('--l2_reg', type=float, default=1e-4)
     hparams.add_argument('--dropout', type=float, default=0)
     hparams.add_argument('--treat_embed', type=bool, default=True)
-    hparams.add_argument('--lambda', type=float, default=1.0, help='weight of wass_loss in loss function')
+    hparams.add_argument('--lambda_pddm', type=float, default=1.0, help='weight of pddm_loss in loss function')
     hparams.add_argument('--propensity_dir', type=str, default='simi_ite/tmp/propensity_model', help='directory storing the pretrained propensity artifacts')
+
+    hparams.add_argument('--ot', type=str, default='uot', help='ot, uot, lot, none')
+    hparams.add_argument('--lambda', type=float, default=2.0, help='weight of wass_loss in loss function')
+    hparams.add_argument('--ot_scale', type=float, default=1.0, help='weight of x distance. In IHDP, it should be set to 0.5-2.0 according to simulation conditions')
+    hparams.add_argument('--epsilon', type=float, default=1.0, help='Entropic Regularization in sinkhorn. In IHDP, it should be set to 0.5-5.0 according to simulation conditions')
+    hparams.add_argument('--kappa', type=float, default=1.0, help='weight of marginal constraint in UOT. In IHDP, it should be set to 0.1-5.0 according to simulation conditions')
+    hparams.add_argument('--gamma', type=float, default=0.0005, help='weight of joint distribution alignment. In IHDP, it should be set to 0.0001-0.005 according to simulation conditions')
+    hparams.add_argument('--ot_joint_bp', type=bool, default=True, help='weight of joint distribution alignment')
+
+
     hparams = vars(hparams.parse_args())
 
-    # path = f"Resultsparam/{hparams['data']}/{hparams['model']}/{hparams['ot']}_{hparams['lambda']}_{hparams['epsilon']}_{hparams['kappa']}_{hparams['gamma']}_{hparams['batchSize']}_{hparams['treat_weight']}_{hparams['ot_scale']}_{hparams['seed']}"
-    path = f"Resultsparam/{hparams['data']}/{hparams['model']}/SITE_{hparams['lambda']}_{hparams['batchSize']}_{hparams['treat_weight']}_{hparams['seed']}_maxminscaler" 
+    path = f"Resultsparam/{hparams['data']}/{hparams['model']}/{hparams['ot']}_{hparams['lambda']}_{hparams['epsilon']}_{hparams['kappa']}_{hparams['gamma']}_{hparams['batchSize']}_{hparams['treat_weight']}_{hparams['ot_scale']}_{hparams['seed']}_{hparams['lambda_pddm']}"
     writer = SummaryWriter(path)
     torch.manual_seed(hparams['seed'])
     if hasattr(os, 'nice'):
@@ -296,7 +351,3 @@ if __name__ == "__main__":
     estimator = BaseEstimator(board=writer, hparams=hparams)
     estimator.fit()
     writer.close()
-
-
-
-

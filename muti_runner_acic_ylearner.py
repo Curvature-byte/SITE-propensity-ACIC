@@ -11,7 +11,7 @@ import os
 from simi_ite.data_processor_test import MyDataset
 from models import *
 from simi_ite.utils import find_three_pairs, get_simi_ground,  get_three_pair_simi, similarity_score
-from simi_ite.utils_test import  metric_update,  metric_export, metrics
+from simi_ite.utils_test import  metric_update, metrics
 from simi_ite.pddm_net import compute_pddm_loss, PDDMNetwork
 from simi_ite.propensity import load_propensity_score
 import ot
@@ -56,8 +56,6 @@ def cal_wass(rep_0, rep_1, out_0, out_1, t, yf, device, hparams):
 
     loss_wass = torch.sum(gamma * dist)
     return loss_wass
-
-
 class BaseEstimator:
 
     def __init__(self, board=None, hparams={}):
@@ -77,12 +75,8 @@ class BaseEstimator:
         self.eval_data = DataLoader(eval_set, batch_size=256,shuffle=True)
         self.test_data = DataLoader(test_set, batch_size=256,shuffle=True)
 
-        # self.scaler = shared_scaler
-        # self.train_scaler = shared_scaler
-        # self.eval_scaler = shared_scaler
-        # self.test_scaler = shared_scaler
 
-        self.train_metric = {
+        self.eval_metric = {
              "mae_ate": np.array([]),
              "mae_att": np.array([]),
              "pehe": np.array([]),
@@ -92,8 +86,8 @@ class BaseEstimator:
              "rmse_cf": np.array([]),
              "auuc": np.array([]),
              "rauuc": np.array([])}
-        self.eval_metric = deepcopy(self.train_metric)
-        self.test_metric = deepcopy(self.train_metric)
+        # self.eval_metric = deepcopy(self.train_metric)
+        # self.test_metric = deepcopy(self.train_metric)
 
         self.train_best_metric = {
              "mae_ate": None,
@@ -109,31 +103,31 @@ class BaseEstimator:
         self.eval_best_metric['r2_f'] = -10  
         self.eval_best_metric["pehe"] = 100
         self.eval_best_metric['auuc'] = 0
-        self.loss_metric = {'loss': np.array([]), 'loss_f': np.array([]), 'loss_pddm': np.array([]), 'loss_c': np.array([])}
+        self.test_best_metric = deepcopy(self.train_best_metric)
+        # loss_metric = {'loss': np.array([]), 'loss_f': np.array([]), 'loss_pddm': np.array([]), 'loss_c': np.array([])}
 
         self.epochs = hparams.get('epoch', 200)
-        self._pddm_warning_emitted = False
-
-        self.model = TARNetHead(train_set.x_dim, hparams).to(self.device)
-        self.rep_model = self.model.rep
-        self.propensity_model = load_propensity_score(model_dir = './simi_ite/ACIC/propensity_model' ,input_dim = train_set.x_dim ,mode="mlp")
-        self.pddm_model = PDDMNetwork(
-            dim_in=hparams['dim_pddm_in'],
-            dim_pddm=hparams['dim_pddm_hide'],
-            dim_c=hparams['dim_pddm_c'],
-        ).to(self.device)
-
+        # self._pddm_warning_emitted = False
+        self.model = YLearner(train_set.x_dim, hparams).to(self.device)
+        # self.rep_model = self.model.rep
+        # self.propensity_model = load_propensity_score(model_dir = './simi_ite/ACIC/propensity_model' ,input_dim = train_set.x_dim ,mode="mlp")
+        # self.pddm_model = PDDMNetwork(
+        #     dim_in=hparams['dim_pddm_in'],
+        #     dim_pddm=hparams['dim_pddm_hide'],
+        #     dim_c=hparams['dim_pddm_c'],
+        # ).to(self.device)
         self.criterion = torch.nn.MSELoss()
         self.optimizer = torch.optim.Adam(
-            list(self.model.parameters()) + list(self.pddm_model.parameters()),
+            self.model.parameters(),
             lr=hparams.get('lr', 1e-3),
             weight_decay=hparams.get('l2_reg', 1e-4)
         )
+        # optimizer = torch.optim.Adam(model.parameters(), lr=hparams.get('lr', 1e-3), weight_decay=hparams.get('l2_reg', 1e-4))
         self.hparams = hparams
         self.epoch = 0
-        self.board = board
+        # board = board
 
-    def fit(self):
+    def fit( self):
 
         iter_num = 0
         stop_epoch = 0 # record how many iterations the eval metrics do not improve
@@ -141,7 +135,7 @@ class BaseEstimator:
 
             self.epoch = epoch
             self.model.train()
-            self.pddm_model.train()
+            # self.pddm_model.train()
             for data in self.train_loader:  # train_loader
                 self.model.zero_grad()
                 data = data.to(self.device)
@@ -149,7 +143,6 @@ class BaseEstimator:
                 # _x, _xt, _t, _yf = data[:, 1:-3], data[:, 1:-2], data[:, -3], data[:, -1]
                 _pred_f = self.model(_xt).squeeze(-1)
                 _loss_fit = self.criterion(_pred_f, _yf)
-
                 _loss_wass = 0
                 wass_indicator = (self.hparams['ot'] != 'none' and epoch > 20 and len(_t.unique()) > 1)
                 if wass_indicator: # Avoid samples coming from same group
@@ -162,66 +155,42 @@ class BaseEstimator:
                                           device=self.device,
                                           hparams=self.hparams)
 
-                treated = int((_t > 0.5).sum().item())
-                control = int((_t < 0.5).sum().item())
-                pddm_indicator = (epoch >40 and treated >= 2 and control >= 2)
+                # treated = int((_t > 0.5).sum().item())
+                # control = int((_t < 0.5).sum().item())
+                # pddm_indicator = (self.epoch >40 and treated >= 2 and control >= 2)
 
-                loss_pddm_tensor = torch.tensor(0.0, device=self.device)
-                loss_pddm_value = 0.0
+                # loss_pddm_tensor = torch.tensor(0.0, device=self.device)
+                # # loss_pddm_value = 0.0
 
-                if pddm_indicator:
-                    x_np = _x.detach().cpu().numpy()
-                    t_np = _t.detach().cpu().numpy()
-                    _x_propensity_scores, _x_simi_ground = get_simi_ground(x_np, propensity_model=self.propensity_model)
-                    try:
-                        three_pairs, three_paris_index = find_three_pairs(x_np, t_np, _x_propensity_scores)
-                    except ValueError as exc:
-                        if not self._pddm_warning_emitted:
-                            print(f"[SITE] Skip PDDM for this batch: {exc}")
-                            self._pddm_warning_emitted = True
-                    else:
-                        three_pairs = torch.tensor(three_pairs, dtype=torch.float32, device=self.device)
-                        three_pairs_rep = self.rep_model(three_pairs)
-                        loss_pddm_tensor = compute_pddm_loss(
-                            self.pddm_model,
-                            three_pairs_rep,
-                            _x_simi_ground,
-                            three_paris_index
-                        ).squeeze()
-                        # loss_pddm_value = loss_pddm_tensor.item()
+                # if pddm_indicator:
+                #     x_np = _x.detach().cpu().numpy()
+                #     t_np = _t.detach().cpu().numpy()
+                #     _x_propensity_scores, _x_simi_ground = get_simi_ground(x_np, propensity_model=self.propensity_model)
+                #     try:
+                #         three_pairs, three_paris_index = find_three_pairs(x_np, t_np, _x_propensity_scores)
+                #     except ValueError as exc:
+                #         if not self._pddm_warning_emitted:
+                #             print(f"[SITE] Skip PDDM for this batch: {exc}")
+                #             self._pddm_warning_emitted = True
+                #     else:
+                #         three_pairs = torch.tensor(three_pairs, dtype=torch.float32, device=self.device)
+                #         three_pairs_rep = self.rep_model(three_pairs)
+                #         loss_pddm_tensor = compute_pddm_loss(
+                #             self.pddm_model,
+                #             three_pairs_rep,
+                #             _x_simi_ground,
+                #             three_paris_index
+                #         ).squeeze()
+                #         # loss_pddm_value = loss_pddm_tensor.item()
 
                 _loss = _loss_fit + self.hparams['lambda'] * _loss_wass  #+ self.hparams['lambda_pddm'] * loss_pddm_tensor 
                 _loss.backward()
                 self.optimizer.step()
-                _loss_wass = _loss_wass.item() if wass_indicator else 0
-                self.board.add_scalar(
-                    'loss/fit_loss',
-                    _loss_fit.item(),
-                    global_step=iter_num)
-                self.board.add_scalar(
-                    'loss/pddm_loss',
-                    loss_pddm_tensor.item(),
-                    global_step=iter_num)
-                self.board.add_scalar(
-                    'loss/total_loss',
-                    _loss.item(),
-                    global_step=iter_num)
-                self.board.add_scalar(
-                    'loss/wass_loss',
-                    _loss_wass,
-                    global_step=iter_num)
                 iter_num += 1
 
-            # Section: evaluation and model selection
-            if self.epoch % 10 == 0:
-                _train_metric = self.evaluation(data='train')
-                self.train_metric = metric_update(self.train_metric, _train_metric, self.epoch)
-                [self.board.add_scalar(f"train/{key}", _train_metric[key], global_step=self.epoch) for key in _train_metric.keys()]
-
+           
             if self.epoch % 1 == 0:
                 _eval_metric = self.evaluation(data='eval')
-                self.eval_metric = metric_update(self.eval_metric, _eval_metric, self.epoch)
-                [self.board.add_scalar(f"eval/{key}", _eval_metric[key], global_step=self.epoch) for key in _eval_metric.keys()]
 
                 if abs(_eval_metric['auuc']) > abs(self.eval_best_metric['auuc']):
                 # if abs(_eval_metric['pehe']) < abs(self.eval_best_metric['pehe']):
@@ -233,22 +202,13 @@ class BaseEstimator:
                 else:
                     stop_epoch += 1
             if stop_epoch >= self.hparams['stop_epoch'] and self.epoch > 200:
+                                             
                 print(f'Early stop at epoch {self.epoch}')
                 break
 
             self.epoch += 1
+        return self.train_best_metric, self.test_best_metric
 
-        # _test_metric = self.evaluation(data='test')
-        # self.test_metric = metric_update(self.test_metric, _test_metric, self.epoch, )
-        # [self.board.add_scalar(f"test/{key}", _test_metric[key], global_step=self.epoch) for key in _test_metric.keys()]
-
-        [self.board.add_scalar(f"train_best/{key}", self.train_best_metric[key], global_step=self.epoch) for key in self.train_best_metric.keys()]
-        [self.board.add_scalar(f"eval_best/{key}", self.eval_best_metric[key], global_step=self.epoch) for key in self.eval_best_metric.keys()]
-        [self.board.add_scalar(f"test_best/{key}", self.test_best_metric[key], global_step=self.epoch) for key in self.test_best_metric.keys()]
-        # self.eval_best_metric = {'eval_best/' + key: self.eval_best_metric[key] for key in self.eval_best_metric.keys()}
-        # self.board.add_hparams(hparam_dict=self.hparams, metric_dict=self.eval_best_metric)
-        self.board.add_graph(self.model, _xt)
-        metric_export(path, self.train_best_metric, self.eval_best_metric, self.test_best_metric)
 
     def predict(self, dataloader):
         """
@@ -277,8 +237,8 @@ class BaseEstimator:
         pred_0 = pred_0.detach().cpu().numpy()
         pred_1 = pred_1.detach().cpu().numpy()
         yf = yf.cpu().numpy()
-        # pred_0 = self.scaler.reverse_y(pred_0)
-        # yf = self.scaler.reverse_y(yf)
+        # pred_0 = scaler.reverse_y(pred_0)
+        # yf = scaler.reverse_y(yf)
         ycf = ycf.cpu().numpy()
         t = t.detach().cpu().numpy()
         return pred_0, pred_1, yf, ycf, t
@@ -289,7 +249,7 @@ class BaseEstimator:
             'train': self.traineval_data,
             'eval': self.eval_data,
             'test': self.test_data}[data]
-        # pred_0, yf, pred_1, yf, ycf, t = self.predict(dataloader)
+        # pred_0, yf, pred_1, yf, ycf, t = predict(dataloader)
         pred_0, pred_1, yf, ycf, t = self.predict(dataloader)
         # pred_0, pred_1, yf = scaler.reverse_y(pred_0), scaler.reverse_y(pred_1), scaler.reverse_y(yf)  # 标签反归一化
         mode = 'in-sample' if data == 'train' else 'out-sample'
@@ -297,9 +257,13 @@ class BaseEstimator:
 
         return metric
 
+def global_metric_update(metric: dict(), metric_: dict()):
+    for key in metric_.keys():
+        metric[key] = np.concatenate([metric[key], [metric_[key]]])
+    return metric
 
 if __name__ == "__main__":
-
+    
     hparams = argparse.ArgumentParser(description='hparams')
     hparams.add_argument('--info', type=str, default='SITE')
     hparams.add_argument('--dim_pddm_in', type=int, default=60)
@@ -325,25 +289,47 @@ if __name__ == "__main__":
     hparams.add_argument('--l2_reg', type=float, default=1e-4)
     hparams.add_argument('--dropout', type=float, default=0)
     hparams.add_argument('--treat_embed', type=bool, default=True)
-    hparams.add_argument('--lambda_pddm', type=float, default=0.0, help='weight of pddm_loss in loss function')
+    hparams.add_argument('--lambda_pddm', type=float, default=1.0, help='weight of pddm_loss in loss function')
     hparams.add_argument('--propensity_dir', type=str, default='simi_ite/tmp/propensity_model', help='directory storing the pretrained propensity artifacts')
 
     hparams.add_argument('--ot', type=str, default='uot', help='ot, uot, lot, none')
-    hparams.add_argument('--lambda', type=float, default=2.0, help='weight of wass_loss in loss function')
+    hparams.add_argument('--lambda', type=float, default=1.0, help='weight of wass_loss in loss function')
     hparams.add_argument('--ot_scale', type=float, default=0.1, help='weight of x distance. In IHDP, it should be set to 0.5-2.0 according to simulation conditions')
     hparams.add_argument('--epsilon', type=float, default=1.0, help='Entropic Regularization in sinkhorn. In IHDP, it should be set to 0.5-5.0 according to simulation conditions')
     hparams.add_argument('--kappa', type=float, default=1.0, help='weight of marginal constraint in UOT. In IHDP, it should be set to 0.1-5.0 according to simulation conditions')
     hparams.add_argument('--gamma', type=float, default=0.0005, help='weight of joint distribution alignment. In IHDP, it should be set to 0.0001-0.005 according to simulation conditions')
     hparams.add_argument('--ot_joint_bp', type=bool, default=True, help='weight of joint distribution alignment')
+    hparams_base = vars(hparams.parse_args())
+
+    train_results = {
+        "mae_ate": np.array([]), "mae_att": np.array([]), "pehe": np.array([]),
+        "r2_f": np.array([]), "rmse_f": np.array([]), "r2_cf": np.array([]),
+        "rmse_cf": np.array([]), "auuc": np.array([]), "rauuc": np.array([])
+    }
+    test_results = deepcopy(train_results)
+    total_run = 10
+    for i in range(total_run):
+        print(f"Run {i+1}/{total_run} with seed {hparams_base['seed'] + i}")
+        hparams = deepcopy(hparams_base)
+        # 更新种子
+        current_seed = hparams['seed'] + i 
+        hparams['seed'] = current_seed
+        # np.random.seed(current_seed)
+        # # 如果用到了 cuda，最好也加上这个
+        # if torch.cuda.is_available():
+        #     torch.cuda.manual_seed_all(current_seed)
 
 
-    hparams = vars(hparams.parse_args())
-
-    path = f"Resultsparam/{hparams['data']}/{hparams['model']}/{hparams['ot']}_{hparams['lambda']}_{hparams['epsilon']}_{hparams['kappa']}_{hparams['gamma']}_{hparams['batchSize']}_{hparams['treat_weight']}_{hparams['ot_scale']}_{hparams['seed']}_{hparams['lambda_pddm']}_{hparams['batch_norm']}"
-    writer = SummaryWriter(path)
-    torch.manual_seed(hparams['seed'])
-    if hasattr(os, 'nice'):
-        os.nice(0)
-    estimator = BaseEstimator(board=writer, hparams=hparams)
-    estimator.fit()
-    writer.close()
+        torch.manual_seed(current_seed)
+        estimator = BaseEstimator(hparams=hparams)
+        train_best_metric, test_best_metric = estimator.fit()
+        train_results = global_metric_update(train_results, train_best_metric)
+        test_results = global_metric_update(test_results, test_best_metric)
+    print("Average Train Results over {} runs:".format(total_run))
+    key_results = ["pehe",  "auuc"]
+    for key in key_results:
+        print(f"{key}: {np.mean(train_results[key])} ± {np.std(train_results[key])}")
+    print("Average Test Results over {} runs:".format(total_run))
+    for key in key_results:
+        print(f"{key}: {np.mean(test_results[key])} ± {np.std(test_results[key])}")
+        # writer.close()
